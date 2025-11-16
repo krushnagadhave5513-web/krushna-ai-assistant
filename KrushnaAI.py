@@ -1,23 +1,44 @@
 import streamlit as st
 from openai import OpenAI
 
-st.set_page_config(page_title="Krushna AI Assistant", page_icon="🤖")
-
+# ------------------------------
+# LOAD API KEY FROM STREAMLIT SECRETS
+# ------------------------------
 API_KEY = st.secrets["API_KEY"]
 client = OpenAI(api_key=API_KEY)
 
+# ------------------------------
+# STREAMLIT UI SETTINGS
+# ------------------------------
+st.set_page_config(page_title="Krushna AI Assistant")
+
 st.title("🤖 Krushna AI Assistant")
-st.write("Built using **Streamlit + OpenAI API**")
+st.write("Built using Streamlit + OpenAI API")
 
-prompt = st.text_input("Type your message:")
+# ------------------------------
+# USER INPUT
+# ------------------------------
+user_input = st.text_input("Type your message:")
 
+# ------------------------------
+# SEND MESSAGE TO OPENAI
+# ------------------------------
 if st.button("Send"):
-    if prompt.strip() == "":
-        st.warning("Please enter a message!")
+    if not user_input.strip():
+        st.warning("Please type something before sending.")
     else:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}]
-        )
-        reply = response.choices[0].message["content"]
-        st.success(reply)
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "user", "content": user_input}
+                ]
+            )
+
+            # NEW FORMAT:
+            reply = response.choices[0].message["content"]
+
+            st.success(reply)
+
+        except Exception as e:
+            st.error("Error: " + str(e))
