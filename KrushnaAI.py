@@ -8,10 +8,9 @@ API_KEY = st.secrets["API_KEY"]
 client = OpenAI(api_key=API_KEY)
 
 # ------------------------------
-# STREAMLIT UI SETTINGS
+# STREAMLIT UI
 # ------------------------------
 st.set_page_config(page_title="Krushna AI Assistant")
-
 st.title("🤖 Krushna AI Assistant")
 st.write("Built using Streamlit + OpenAI API")
 
@@ -21,7 +20,7 @@ st.write("Built using Streamlit + OpenAI API")
 user_input = st.text_input("Type your message:")
 
 # ------------------------------
-# SEND MESSAGE TO OPENAI
+# SEND MESSAGE
 # ------------------------------
 if st.button("Send"):
     if not user_input.strip():
@@ -35,8 +34,8 @@ if st.button("Send"):
                 ]
             )
 
-            # NEW FORMAT:
-            reply = response.choices[0].message["content"]
+            # CORRECT FORMAT
+            reply = response.choices[0].message.content
 
             st.success(reply)
 
