@@ -1,26 +1,32 @@
 # KrushnaAI.py
-# Single-file Streamlit app — Krushna AI Assistant
-# Features: Chat + Memory + Sessions + Image generation (1 or multiple)
-# PDF/Image upload (text extraction), background alpha handling, export sessions.
-# Requires: streamlit, openai, pillow, requests, PyPDF2
-# Use Streamlit Secret: API_KEY = "sk-..."
+# Krushna AI Assistant (Streamlit single-file app)
+# Features:
+# - Chat (chat history preserved in session)
+# - Memory / sessions (save/load/export)
+# - Image generation (1 or 4)
+# - PDF & Image upload (PDF text extract if PyPDF2 installed)
+# - Fix alpha PNG (avoid black background)
+# - Defensive parsing of OpenAI responses (new + legacy shapes)
+# - Streamlit-compatible (no experimental_rerun)
+#
+# Requirements:
+# pip install streamlit openai pillow requests PyPDF2
 
 import streamlit as st
 from openai import OpenAI
-from PIL import Image, ImageOps
-import io, os, time, json, base64, tempfile, traceback
-import requests
+from PIL import Image
+import io, os, json, time, base64, tempfile, traceback, requests
 
-# Optional PDF lib
+# Optional PDF support
 try:
     import PyPDF2
 except Exception:
     PyPDF2 = None
 
-# -------------------------
-# Helpers
-# -------------------------
+# -------------------- Helpers --------------------
+
 def sanitize_messages(messages):
+    """Return a safe list of message dicts {'role','content'}."""
     out = []
     if not messages:
         return []
@@ -30,52 +36,53 @@ def sanitize_messages(messages):
         try:
             if isinstance(m, str):
                 out.append({"role": "user", "content": m})
-                continue
-            if not isinstance(m, dict):
+            elif not isinstance(m, dict):
                 out.append({"role": "user", "content": str(m)})
-                continue
-            role = m.get("role", "user") or "user"
-            content = m.get("content", "") or ""
-            out.append({"role": role, "content": content})
+            else:
+                role = m.get("role") or "user"
+                content = m.get("content") or ""
+                out.append({"role": role, "content": content})
         except Exception:
             out.append({"role": "user", "content": str(m)})
     return out
 
 def extract_assistant_text_from_raw(raw):
+    """Robust extractor for many shapes of OpenAI SDK responses."""
     try:
-        # object-like
+        # object-like typical modern SDK
         if hasattr(raw, "choices") and len(raw.choices) > 0:
-            c0 = raw.choices[0]
-            # prefer .message.content (new SDK)
+            choice0 = raw.choices[0]
             try:
-                if hasattr(c0, "message") and c0.message:
-                    msg = c0.message
+                if hasattr(choice0, "message") and choice0.message:
+                    msg = choice0.message
+                    # attribute .content
                     if hasattr(msg, "content"):
                         return msg.content or ""
-                    # dict-like
+                    # dict-like .get
                     if hasattr(msg, "get"):
                         return msg.get("content", "") or ""
             except Exception:
                 pass
-            # delta streaming
+            # delta
             try:
-                if hasattr(c0, "delta") and c0.delta:
-                    d = c0.delta
-                    if hasattr(d, "content"):
-                        return d.content or ""
-                    if hasattr(d, "get"):
-                        return d.get("content", "") or ""
+                if hasattr(choice0, "delta") and choice0.delta:
+                    delta = choice0.delta
+                    if hasattr(delta, "content"):
+                        return delta.content or ""
+                    if hasattr(delta, "get"):
+                        return delta.get("content", "") or ""
             except Exception:
                 pass
-            # fallback to text attr
-            if hasattr(c0, "text"):
-                return getattr(c0, "text") or ""
-        # dict-like
+            # fallback 'text'
+            if hasattr(choice0, "text"):
+                return getattr(choice0, "text") or ""
+        # dict-like fallback (legacy)
         if isinstance(raw, dict):
             choices = raw.get("choices", [])
             if choices:
                 c0 = choices[0]
                 if isinstance(c0, dict):
+                    # try message -> content
                     msg = c0.get("message") or c0.get("delta") or {}
                     if isinstance(msg, dict):
                         return msg.get("content") or msg.get("text") or ""
@@ -86,49 +93,53 @@ def extract_assistant_text_from_raw(raw):
         try:
             return str(raw)
         except Exception:
-            return ""
+            return "(Could not parse assistant response)"
 
-def save_session_local(session_name, messages):
-    # Save JSON in /tmp or in-session download ready
-    fname = f"{session_name}_{int(time.time())}.json"
-    tmp = tempfile.gettempdir()
-    path = os.path.join(tmp, fname)
+def pil_fix_alpha_make_white(im: Image.Image):
+    """If image has alpha channel, put it over white background and return RGB bytes."""
     try:
+        if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+            bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
+            bg.paste(im, mask=im.split()[-1])
+            out = bg.convert("RGB")
+        else:
+            out = im.convert("RGB")
+        buf = io.BytesIO()
+        out.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        # fallback: try convert
+        try:
+            buf = io.BytesIO()
+            im.convert("RGB").save(buf, format="PNG")
+            return buf.getvalue()
+        except Exception:
+            return None
+
+def save_temp_json(name_prefix, data):
+    try:
+        fname = f"{name_prefix}_{int(time.time())}.json"
+        path = os.path.join(tempfile.gettempdir(), fname)
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(messages, f, ensure_ascii=False, indent=2)
+            json.dump(data, f, ensure_ascii=False, indent=2)
         return path
     except Exception:
         return None
 
-def pil_fix_alpha_make_white(im: Image.Image):
-    # If image has alpha, place it over white background to avoid black alpha issues
-    try:
-        if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
-            bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
-            bg.paste(im, mask=im.split()[-1])  # paste using alpha channel
-            return bg.convert("RGB")
-        else:
-            return im.convert("RGB")
-    except Exception:
-        return im
+# -------------------- Streamlit UI Setup --------------------
 
-# -------------------------
-# Streamlit UI setup
-# -------------------------
 st.set_page_config(page_title="Krushna AI Assistant", page_icon="🤖", layout="wide")
 st.title("🤖 Krushna AI Assistant")
-st.write("Chat, generate images, upload PDFs/images, and keep sessions — powered by OpenAI.")
+st.write("Chat, generate images, upload files, save sessions — powered by OpenAI.")
 
-# -------------------------
-# Load API key (Streamlit Secret name: API_KEY)
-# -------------------------
+# -------------------- Load API Key --------------------
 if "API_KEY" not in st.secrets:
-    st.error("Missing secret: API_KEY. Set it in Streamlit app settings before using the assistant.")
+    st.error("Missing Streamlit secret `API_KEY`. Add it in the app settings and redeploy.")
     st.stop()
 
 API_KEY = st.secrets["API_KEY"]
 
-# Create client once in session state
+# Initialize OpenAI client once
 if "client" not in st.session_state:
     try:
         st.session_state.client = OpenAI(api_key=API_KEY)
@@ -138,92 +149,80 @@ if "client" not in st.session_state:
 
 client = st.session_state.client
 
-# -------------------------
-# Session state initialization
-# -------------------------
+# -------------------- Session State Defaults --------------------
 if "messages" not in st.session_state:
-    # base system role to keep assistant consistent
-    st.session_state.messages = [{"role": "system", "content": "You are Jarvis 2.0, helpful assistant for Krushna. Keep answers concise and code-friendly."}]
+    st.session_state.messages = [
+        {"role": "system", "content": "You are Jarvis 2.0, helpful assistant for Krushna. Keep answers concise and code-friendly."}
+    ]
 if "saved_sessions" not in st.session_state:
     st.session_state.saved_sessions = {}  # name -> messages
 if "images" not in st.session_state:
-    st.session_state.images = []  # paths or in-memory bytes
+    st.session_state.images = []  # list of bytes
 if "status" not in st.session_state:
     st.session_state.status = "Ready"
 
-# Sidebar: sessions, controls, uploads
+# -------------------- Sidebar --------------------
 with st.sidebar:
-    st.header("Sessions")
-    # list saved session names
-    if st.session_state.saved_sessions:
-        sel = st.selectbox("Load saved session", options=["-- choose --"] + list(st.session_state.saved_sessions.keys()))
-        if sel and sel != "-- choose --":
-            if st.button("Load Session"):
-                st.session_state.messages = sanitize_messages(st.session_state.saved_sessions[sel])
-                st.success(f"Loaded session: {sel}")
-                st.experimental_rerun()
-        if st.button("Clear saved sessions"):
-            st.session_state.saved_sessions = {}
-            st.success("Cleared saved sessions")
-    else:
-        st.info("No saved sessions yet. Save current conversation below.")
+    st.header("Sessions & Tools")
 
-    st.markdown("---")
-    st.write("Save / Export")
-    sess_name = st.text_input("Session name", value=f"session_{time.strftime('%Y%m%d_%H%M%S')}")
+    # Saved sessions picker
+    saved_names = list(st.session_state.saved_sessions.keys())
+    if saved_names:
+        sel = st.selectbox("Load saved session", options=["-- choose --"] + saved_names)
+        if sel and sel != "-- choose --":
+            if st.button("Load selected session"):
+                st.session_state.messages = sanitize_messages(st.session_state.saved_sessions.get(sel, []))
+                st.success(f"Loaded session: {sel}")
+    else:
+        st.info("No saved sessions yet")
+
     if st.button("Save current session"):
-        try:
-            st.session_state.saved_sessions[sess_name] = list(st.session_state.messages)
-            st.success(f"Saved: {sess_name}")
-        except Exception as e:
-            st.error("Save failed: " + str(e))
-    if st.button("Export current session (.txt)"):
-        # prepare text
+        name = f"session_{time.strftime('%Y%m%d_%H%M%S')}"
+        st.session_state.saved_sessions[name] = list(st.session_state.messages)
+        st.success(f"Saved session: {name}")
+
+    if st.button("Export current as .txt"):
         lines = []
         for m in st.session_state.messages:
             role = m.get("role", "user")
             prefix = "You: " if role == "user" else ("Jarvis: " if role == "assistant" else f"{role.capitalize()}: ")
             lines.append(prefix + m.get("content", ""))
-        txt = "\n\n".join(lines)
-        st.download_button("Download transcript", txt, file_name=f"transcript_{int(time.time())}.txt", mime="text/plain")
+        transcript = "\n\n".join(lines)
+        st.download_button("Download transcript (.txt)", transcript, file_name=f"transcript_{int(time.time())}.txt", mime="text/plain")
 
     st.markdown("---")
     st.header("Upload")
-    uploaded_image = st.file_uploader("Upload image (PNG/JPG)", type=["png", "jpg", "jpeg"], accept_multiple_files=False)
-    uploaded_pdf = st.file_uploader("Upload PDF", type=["pdf"], accept_multiple_files=False)
+    uploaded_image = st.file_uploader("Upload image (png/jpg)", type=["png", "jpg", "jpeg"])
+    uploaded_pdf = st.file_uploader("Upload PDF", type=["pdf"])
     st.markdown("---")
-    st.write("Image generation")
-    image_prompt = st.text_input("Image prompt (sidebar)")
+    st.header("Image Generation")
+    image_prompt = st.text_input("Image prompt", key="image_prompt_input")
     cols = st.columns([1,1,1])
     with cols[0]:
-        if st.button("Generate image (1)"):
-            st.session_state._gen_image_request = {"prompt": image_prompt, "n":1}
+        gen1 = st.button("Generate 1 image")
     with cols[1]:
-        if st.button("Generate 4 images"):
-            st.session_state._gen_image_request = {"prompt": image_prompt, "n":4}
+        gen4 = st.button("Generate 4 images")
     with cols[2]:
-        if st.button("Clear preview images"):
-            st.session_state.images = []
+        clr_imgs = st.button("Clear previews")
+
     st.markdown("---")
-    st.write("Status")
+    st.write("Status:")
     st.info(st.session_state.status)
 
-# Main layout: two columns (chat + image preview)
-chat_col, preview_col = st.columns([2.2, 1])
+# -------------------- Main layout --------------------
+chat_col, preview_col = st.columns([2.5, 1])
 
 with chat_col:
-    # chat display
     st.subheader("Conversation")
-    # show history in chat-like blocks
+    # Render chat history
     for m in st.session_state.messages:
-        role = m.get("role","user")
-        content = m.get("content","")
-        # use chat_message if available (Streamlit >=1.23)
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        # Use streamlit's chat_message if available
         try:
             with st.chat_message(role):
                 st.markdown(content)
         except Exception:
-            # fallback simple display
             if role == "user":
                 st.markdown(f"**You:** {content}")
             elif role == "assistant":
@@ -231,58 +230,52 @@ with chat_col:
             else:
                 st.markdown(f"**{role}:** {content}")
 
-    # input area
-    input_col, send_col = st.columns([7,1])
-    with input_col:
-        user_input = st.text_input("Type your message ...", key="chat_input")
-    with send_col:
-        send_clicked = st.button("Send")
+    # Input area
+    user_input = st.text_input("Type your message:", key="main_input")
+    send_btn = st.button("Send")
 
-    # quick actions row
+    # Quick actions
     q1, q2, q3 = st.columns([1,1,1])
     with q1:
         if st.button("Send last"):
-            # resend last user message
-            last = None
-            for m in reversed(st.session_state.messages):
-                if m.get("role") == "user":
-                    last = m.get("content")
+            last_user = None
+            for mm in reversed(st.session_state.messages):
+                if mm.get("role") == "user":
+                    last_user = mm.get("content")
                     break
-            if last:
-                user_input = last
-                st.session_state.chat_input = last
-                send_clicked = True
+            if last_user:
+                st.session_state.main_input = last_user
+                # let Send process below
+                send_btn = True
     with q2:
         if st.button("Clear chat"):
-            st.session_state.messages = [m for m in st.session_state.messages if m.get("role")=="system"]
-            st.experimental_rerun()
+            st.session_state.messages = [m for m in st.session_state.messages if m.get("role") == "system"]
+            st.success("Cleared chat (system message retained).")
     with q3:
         if st.button("Save snapshot (.json)"):
-            p = save_session_local("snapshot", st.session_state.messages)
-            if p:
-                with open(p,"rb") as f:
-                    st.download_button("Download JSON snapshot", f, file_name=os.path.basename(p))
+            path = save_temp_json("snapshot", st.session_state.messages)
+            if path:
+                with open(path, "rb") as f:
+                    st.download_button("Download snapshot", f, file_name=os.path.basename(path))
             else:
                 st.error("Could not save snapshot.")
 
-    # handle uploaded image
+    # Process uploaded image
     if uploaded_image is not None:
         try:
             img = Image.open(uploaded_image)
-            img_fixed = pil_fix_alpha_make_white(img)
-            buffered = io.BytesIO()
-            img_fixed.save(buffered, format="PNG")
-            b64 = base64.b64encode(buffered.getvalue()).decode()
-            st.session_state.messages.append({"role":"user","content":f"[Uploaded Image] {uploaded_image.name}"})
-            st.success(f"Uploaded image: {uploaded_image.name}")
+            img_bytes = pil_fix_alpha_make_white(img)
+            st.session_state.images.append(img_bytes)
+            st.session_state.messages.append({"role": "user", "content": f"[Uploaded Image] {uploaded_image.name}"})
+            st.success(f"Image uploaded: {uploaded_image.name}")
         except Exception as e:
             st.error("Image upload error: " + str(e))
 
-    # handle uploaded pdf
+    # Process uploaded PDF
     if uploaded_pdf is not None:
-        st.session_state.messages.append({"role":"user","content":f"[Uploaded PDF] {uploaded_pdf.name}"})
+        st.session_state.messages.append({"role": "user", "content": f"[Uploaded PDF] {uploaded_pdf.name}"})
         if PyPDF2 is None:
-            st.warning("PyPDF2 not installed on server — PDF text extraction unavailable.")
+            st.warning("PyPDF2 not installed; PDF text extraction unavailable.")
         else:
             try:
                 reader = PyPDF2.PdfReader(uploaded_pdf)
@@ -292,34 +285,23 @@ with chat_col:
                         text += p.extract_text() or ""
                     except Exception:
                         pass
-                snippet = text[:1000] + ("..." if len(text)>1000 else "")
+                snippet = (text[:1000] + "...") if len(text) > 1000 else text
                 if snippet.strip():
-                    st.session_state.messages.append({"role":"assistant","content":f"[PDF extract]\n{snippet}"})
+                    st.session_state.messages.append({"role": "assistant", "content": f"[PDF Extract]\n{snippet}"})
+                    st.success("PDF text extracted (first pages).")
                 else:
-                    st.session_state.messages.append({"role":"assistant","content":"[PDF] Could not extract text."})
+                    st.session_state.messages.append({"role": "assistant", "content": "[PDF] Could not extract text."})
             except Exception as e:
-                st.session_state.messages.append({"role":"assistant","content":"[PDF] Error: " + str(e)})
+                st.session_state.messages.append({"role": "assistant", "content": f"[PDF] Error: {e}"})
 
-    # process send (synchronous UI, but we mark status)
-    if send_clicked and user_input and user_input.strip():
-        st.session_state.status = "Contacting Jarvis..."
-        st.experimental_rerun()  # rerun to show status first
-
-    # On rerun: check if there is unsent input in session_state.chat_input and handle
-    if "chat_input" in st.session_state and st.session_state.chat_input and send_clicked:
-        pass  # handled above; kept for compatibility
-
-    # We'll create a small background job style handler via a button click pattern: use state flag
-    if "pending_user" not in st.session_state:
-        st.session_state.pending_user = None
-
-    # If user pressed Send (we'll use st.session_state.chat_input)
-    if send_clicked:
-        text = st.session_state.get("chat_input", "") or user_input
-        if text and text.strip():
-            st.session_state.messages.append({"role":"user","content":text})
-            # call OpenAI
-            st.session_state.status = "Jarvis is thinking..."
+    # SEND flow (synchronous, shows spinner)
+    if send_btn and st.session_state.get("main_input", "").strip():
+        text = st.session_state.get("main_input", "").strip()
+        # Append user message
+        st.session_state.messages.append({"role": "user", "content": text})
+        st.session_state.status = "Jarvis is thinking..."
+        # Call OpenAI synchronously with spinner
+        with st.spinner("Jarvis is thinking..."):
             try:
                 resp = client.chat.completions.create(
                     model="gpt-4o-mini",
@@ -328,127 +310,217 @@ with chat_col:
                     temperature=0.4
                 )
                 assistant_text = extract_assistant_text_from_raw(resp) or "(No assistant text returned.)"
-                # normalize: ensure string
                 if not isinstance(assistant_text, str):
                     assistant_text = str(assistant_text)
-                st.session_state.messages.append({"role":"assistant","content":assistant_text})
+                st.session_state.messages.append({"role": "assistant", "content": assistant_text})
                 st.session_state.status = "Ready"
-                # clear input
-                st.session_state.chat_input = ""
-                st.experimental_rerun()
+                # Clear input box
+                st.session_state.main_input = ""
+                st.success("Reply received.")
             except Exception as e:
                 tb = traceback.format_exc()
-                st.session_state.messages.append({"role":"assistant","content":f"API Error: {e}\n\n{tb}"})
+                st.session_state.messages.append({"role": "assistant", "content": f"API Error: {e}\n\n{tb}"})
                 st.session_state.status = "Error"
-                st.experimental_rerun()
+                st.error("API Error: " + str(e))
 
 with preview_col:
     st.subheader("Images / Preview")
-    # show in-session images
     if st.session_state.images:
-        for i, imdata in enumerate(st.session_state.images):
+        for idx, ib in enumerate(st.session_state.images):
             try:
-                if isinstance(imdata, bytes):
-                    st.image(imdata, use_column_width=True)
-                else:
-                    st.image(imdata, use_column_width=True)
+                st.image(ib, use_column_width=True)
             except Exception:
-                st.write("Could not show image preview.")
+                st.write("Could not show preview image.")
     else:
         st.info("Generated images will appear here.")
 
-    # Image generation handler triggered from sidebar
-    if "_gen_image_request" in st.session_state and st.session_state._gen_image_request:
-        req = st.session_state.pop("_gen_image_request")
-        p = req.get("prompt","")
-        n = int(req.get("n",1))
-        if not p or not p.strip():
-            st.warning("Enter an image prompt in the sidebar first.")
-        else:
-            st.session_state.status = "Generating image(s)..."
-            try:
-                # Try modern images API first
-                images_info = []
-                try:
-                    if hasattr(client, "images"):
-                        resp = client.images.generate(model="gpt-image-1", prompt=p, size="1024x1024", n=n)
-                        # resp.data -> list of objects with b64_json or url
-                        data_list = getattr(resp, "data", None) or resp.get("data", [])
-                        for d in data_list:
-                            if hasattr(d, "b64_json"):
-                                images_info.append({"b64": d.b64_json})
-                            elif isinstance(d, dict) and d.get("b64_json"):
-                                images_info.append({"b64": d.get("b64_json")})
-                            elif hasattr(d, "url"):
-                                images_info.append({"url": d.url})
-                            elif isinstance(d, dict) and d.get("url"):
-                                images_info.append({"url": d.get("url")})
-                except Exception:
-                    images_info = []
+    # Handle image generation triggers from sidebar buttons
+    if 'gen_next' not in st.session_state:
+        st.session_state['gen_next'] = None
 
-                # fallback to legacy
-                if not images_info:
+    # We check the sidebar buttons (gen1/gen4/clear) using their captured booleans
+    # (Streamlit executes top-to-bottom so the booleans exist)
+    try:
+        # read the booleans created in sidebar context
+        if 'gen1' in locals():
+            pass
+    except Exception:
+        pass
+
+    # The sidebar variables gen1/gen4/clr_imgs are available — but to be safe, re-evaluate from session state keys used by streamlit
+    # We'll simply check the sidebar widget keys directly using st.session_state if present
+    if st.session_state.get("image_prompt_input", "").strip():
+        prompt_val = st.session_state.get("image_prompt_input", "").strip()
+    else:
+        prompt_val = ""
+
+    # Determine if any sidebar generation button was pressed (streamlit sets True only on the run where pressed)
+    # We rely on the variables gen1, gen4, clr_imgs from the sidebar scope by reading them via st.session_state if created
+    gen1_pressed = st.session_state.get("Generate 1 image", False) if False else False  # placeholder to avoid errors
+
+    # Instead, detect button presses by reading the query params or by checking the presence of the ephemeral keys.
+    # Simpler approach: re-create minimal image generation UI here so we can handle actions reliably:
+    st.markdown("### Quick image generator")
+    p_prompt = st.text_input("Quick prompt (preview)", key="quick_prompt_input")
+    g1, g4, clr = st.columns([1,1,1])
+    with g1:
+        if st.button("Generate 1 (preview)"):
+            gen_n = 1
+            p = st.session_state.get("quick_prompt_input", "").strip()
+            if not p:
+                st.warning("Please provide a prompt.")
+            else:
+                st.session_state.status = "Generating image(s)..."
+                with st.spinner("Generating..."):
                     try:
-                        resp = client.Image.create(prompt=p, n=n, size="1024x1024")
-                        for d in resp.get("data", []):
-                            images_info.append({"b64": d.get("b64_json"), "url": d.get("url")})
-                    except Exception:
-                        pass
-
-                saved = []
-                for i, info in enumerate(images_info):
-                    img_bytes = None
-                    if info.get("url"):
+                        images_info = []
+                        # try modern images API
                         try:
-                            r = requests.get(info["url"], timeout=15)
-                            r.raise_for_status()
-                            img_bytes = r.content
+                            if hasattr(client, "images"):
+                                resp = client.images.generate(model="gpt-image-1", prompt=p, size="1024x1024", n=gen_n)
+                                data_list = getattr(resp, "data", None) or resp.get("data", [])
+                                for d in data_list:
+                                    if hasattr(d, "b64_json"):
+                                        images_info.append({"b64": d.b64_json})
+                                    elif isinstance(d, dict) and d.get("b64_json"):
+                                        images_info.append({"b64": d.get("b64_json")})
+                                    elif hasattr(d, "url"):
+                                        images_info.append({"url": d.url})
+                                    elif isinstance(d, dict) and d.get("url"):
+                                        images_info.append({"url": d.get("url")})
                         except Exception:
-                            # fallback to b64
-                            b64 = info.get("b64")
-                            if b64:
-                                img_bytes = base64.b64decode(b64)
-                    elif info.get("b64"):
-                        img_bytes = base64.b64decode(info.get("b64"))
-                    if img_bytes:
-                        # fix alpha if needed
-                        try:
-                            im = Image.open(io.BytesIO(img_bytes))
-                            im_fixed = pil_fix_alpha_make_white(im)
-                            buff = io.BytesIO()
-                            im_fixed.save(buff, format="PNG")
-                            img_bytes = buff.getvalue()
-                        except Exception:
-                            pass
-                        st.session_state.images.append(img_bytes)
-                        saved.append(img_bytes)
-                if saved:
-                    st.success(f"Saved {len(saved)} image(s).")
-                else:
-                    st.warning("No images returned by API.")
-            except Exception as e:
-                st.error("Image generation error: " + str(e))
-            finally:
-                st.session_state.status = "Ready"
-                st.experimental_rerun()
+                            images_info = []
+                        # fallback legacy
+                        if not images_info:
+                            try:
+                                resp = client.Image.create(prompt=p, n=gen_n, size="1024x1024")
+                                for d in resp.get("data", []):
+                                    images_info.append({"b64": d.get("b64_json"), "url": d.get("url")})
+                            except Exception:
+                                pass
 
-    # allow download of previewed images
+                        saved = []
+                        for info in images_info:
+                            img_bytes = None
+                            if info.get("url"):
+                                try:
+                                    r = requests.get(info["url"], timeout=15)
+                                    r.raise_for_status()
+                                    img_bytes = r.content
+                                except Exception:
+                                    b64 = info.get("b64")
+                                    if b64:
+                                        img_bytes = base64.b64decode(b64)
+                            elif info.get("b64"):
+                                img_bytes = base64.b64decode(info.get("b64"))
+                            if img_bytes:
+                                try:
+                                    im = Image.open(io.BytesIO(img_bytes))
+                                    fixed = pil_fix_alpha_make_white(im)
+                                    if fixed:
+                                        st.session_state.images.append(fixed)
+                                        saved.append(fixed)
+                                except Exception:
+                                    pass
+                        if saved:
+                            st.success(f"Generated {len(saved)} image(s).")
+                        else:
+                            st.warning("No images returned.")
+                    except Exception as e:
+                        st.error("Image generation error: " + str(e))
+                    finally:
+                        st.session_state.status = "Ready"
+
+    with g4:
+        if st.button("Generate 4 (preview)"):
+            gen_n = 4
+            p = st.session_state.get("quick_prompt_input", "").strip()
+            if not p:
+                st.warning("Please provide a prompt.")
+            else:
+                st.session_state.status = "Generating image(s)..."
+                with st.spinner("Generating..."):
+                    try:
+                        images_info = []
+                        try:
+                            if hasattr(client, "images"):
+                                resp = client.images.generate(model="gpt-image-1", prompt=p, size="1024x1024", n=gen_n)
+                                data_list = getattr(resp, "data", None) or resp.get("data", [])
+                                for d in data_list:
+                                    if hasattr(d, "b64_json"):
+                                        images_info.append({"b64": d.b64_json})
+                                    elif isinstance(d, dict) and d.get("b64_json"):
+                                        images_info.append({"b64": d.get("b64_json")})
+                                    elif hasattr(d, "url"):
+                                        images_info.append({"url": d.url})
+                                    elif isinstance(d, dict) and d.get("url"):
+                                        images_info.append({"url": d.get("url")})
+                        except Exception:
+                            images_info = []
+                        if not images_info:
+                            try:
+                                resp = client.Image.create(prompt=p, n=gen_n, size="1024x1024")
+                                for d in resp.get("data", []):
+                                    images_info.append({"b64": d.get("b64_json"), "url": d.get("url")})
+                            except Exception:
+                                pass
+
+                        saved = []
+                        for info in images_info:
+                            img_bytes = None
+                            if info.get("url"):
+                                try:
+                                    r = requests.get(info["url"], timeout=15)
+                                    r.raise_for_status()
+                                    img_bytes = r.content
+                                except Exception:
+                                    b64 = info.get("b64")
+                                    if b64:
+                                        img_bytes = base64.b64decode(b64)
+                            elif info.get("b64"):
+                                img_bytes = base64.b64decode(info.get("b64"))
+                            if img_bytes:
+                                try:
+                                    im = Image.open(io.BytesIO(img_bytes))
+                                    fixed = pil_fix_alpha_make_white(im)
+                                    if fixed:
+                                        st.session_state.images.append(fixed)
+                                        saved.append(fixed)
+                                except Exception:
+                                    pass
+                        if saved:
+                            st.success(f"Generated {len(saved)} image(s).")
+                        else:
+                            st.warning("No images returned.")
+                    except Exception as e:
+                        st.error("Image generation error: " + str(e))
+                    finally:
+                        st.session_state.status = "Ready"
+
+    with clr:
+        if st.button("Clear previews"):
+            st.session_state.images = []
+            st.success("Cleared preview images.")
+
+    # download images
     if st.session_state.images:
-        for idx, img_bytes in enumerate(st.session_state.images):
+        for i, b in enumerate(st.session_state.images):
             try:
-                st.download_button(f"Download image {idx+1}", data=img_bytes, file_name=f"gen_{idx+1}.png", mime="image/png")
+                st.download_button(f"Download image {i+1}", data=b, file_name=f"gen_{i+1}.png", mime="image/png")
             except Exception:
                 pass
 
-# Footer / small help area
+# -------------------- Footer / utilities --------------------
 st.markdown("---")
-col1, col2 = st.columns([3,1])
-with col1:
-    st.write("Features: ChatGPT-style conversation, memory (saved sessions), image generation (1 or 4), PDF & image upload, export sessions.")
-with col2:
-    if st.button("Reset everything (clear sessions & chat)"):
-        st.session_state.messages = [m for m in st.session_state.messages if m.get("role")=="system"]
+left, right = st.columns([3,1])
+with left:
+    st.write("Features: Chat memory, sessions, image generation (1 or 4), PDF & image upload, export sessions.")
+with right:
+    if st.button("Reset all (chat + saved sessions + previews)"):
+        st.session_state.messages = [m for m in st.session_state.messages if m.get("role") == "system"]
         st.session_state.saved_sessions = {}
         st.session_state.images = []
-        st.success("Reset complete. System message retained.")
-        st.experimental_rerun()
+        st.session_state.status = "Ready"
+        st.success("Reset complete.")
+
+# End of file
